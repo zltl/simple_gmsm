@@ -42,5 +42,5 @@ $(TARGET_DIR)/libsimple_gmsm.so: $(objs_c) $(objs_cxx)
 doxy:
 	doxygen
 latex: doxy
-	cd target/doc && make
+	cd target/doc/latex && make
 
