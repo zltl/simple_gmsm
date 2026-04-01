@@ -17,7 +17,7 @@ ifeq ($(C_STANDARD),)
     C_STANDARD := c11
 endif
 
-COMMON_FLAG := -Werror -Wall -Wextra -pedantic -Wno-unused-result -fPIC -g
+COMMON_FLAG := -Werror -Wall -Wextra -pedantic -Wno-unused-result -fPIC -g -O2
 COMMON_FLAG += -I$(PROJECT_ROOT_PATH)/include -I${PROJECT_ROOT_PATH}/include
 
 CFLAGS += $(COMMON_FLAG) -std=$(C_STANDARD)

@@ -344,7 +344,7 @@ static void __big_div_r(big_t* c, big_t* r, const big_t* a, const big_t* b) {
         c->num[i + divlen - 1] = d;
         __big_rshift_8x(&div, 1);
     }
-    for (i = xlen - 1; i >= 0; i++) {
+    for (i = xlen - 1; i >= 0; i--) {
         if (r->num[i]) {
             r->sign = 1;
             break;
