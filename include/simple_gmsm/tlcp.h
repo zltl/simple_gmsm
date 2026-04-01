@@ -291,6 +291,10 @@ int tlcp_send_alert(tlcp_conn_t* conn, unsigned char level,
 int tlcp_cert_parse(tlcp_cert_t* cert, const unsigned char* der,
                     unsigned long len);
 
+/// @brief Verify certificate signature using issuer's SM2 public key
+int tlcp_cert_verify_signature(const tlcp_cert_t* cert,
+                               const tlcp_cert_t* issuer_cert);
+
 #ifdef __cplusplus
 }
 #endif
