@@ -1,4 +1,4 @@
-.PHONY: clean doxy latex libsimple_gmsm
+.PHONY: clean doxy latex libsimple_gmsm test
 .ONESHELL:
 
 all: doxy latex libsimple_gmsm
@@ -44,3 +44,17 @@ doxy:
 latex: doxy
 	cd target/doc/latex && make
 
+# Tests
+test_sources = $(wildcard tests/test_*.c)
+test_objs = $(patsubst tests/%.c,$(TARGET_DIR)/tests/%.c.o,$(test_sources))
+
+$(shell mkdir -p $(TARGET_DIR)/tests)
+
+test: $(TARGET_DIR)/test_runner
+	$(TARGET_DIR)/test_runner
+
+$(TARGET_DIR)/tests/%.c.o: tests/%.c
+	$(CC) $(CFLAGS) -I./tests -c $< -o $@
+
+$(TARGET_DIR)/test_runner: $(test_objs) $(TARGET_DIR)/libsimple_gmsm.a
+	$(CC) $(CFLAGS) -o $@ $^ -lm
