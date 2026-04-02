@@ -1,4 +1,4 @@
-.PHONY: clean doxy latex libsimple_gmsm test examples
+.PHONY: clean doxy latex libsimple_gmsm test examples bench bench-bigint bench-bigint-save bench-sm2 bench-sm2-save
 .ONESHELL:
 
 all: doxy latex libsimple_gmsm
@@ -73,6 +73,43 @@ $(shell mkdir -p $(TARGET_DIR)/examples)
 examples: $(example_bins)
 
 $(TARGET_DIR)/examples/%: examples/%.c $(TARGET_DIR)/libsimple_gmsm.a
+	$(CC) $(CFLAGS) -o $@ $< $(TARGET_DIR)/libsimple_gmsm.a -lm
+
+# Benchmarks
+bench_sources = $(wildcard benchmarks/bench_*.c)
+bench_bins = $(patsubst benchmarks/%.c,$(TARGET_DIR)/benchmarks/%,$(bench_sources))
+
+$(shell mkdir -p $(TARGET_DIR)/benchmarks $(TARGET_DIR)/benchmarks/results)
+
+bench: bench-bigint bench-sm2
+
+bench-bigint: $(TARGET_DIR)/benchmarks/bench_bigint
+	$(TARGET_DIR)/benchmarks/bench_bigint
+
+bench-bigint-save: $(TARGET_DIR)/benchmarks/bench_bigint
+	@ts=$$(date -u +%Y%m%dT%H%M%SZ); \
+	out="$(TARGET_DIR)/benchmarks/results/bigint-$$ts.txt"; \
+	latest="$(TARGET_DIR)/benchmarks/results/bigint-latest.txt"; \
+	{ \
+		echo "timestamp=$$ts"; \
+		echo "git_rev=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+		$(TARGET_DIR)/benchmarks/bench_bigint; \
+	} | tee "$$out" | tee "$$latest"
+
+bench-sm2: $(TARGET_DIR)/benchmarks/bench_sm2
+	$(TARGET_DIR)/benchmarks/bench_sm2
+
+bench-sm2-save: $(TARGET_DIR)/benchmarks/bench_sm2
+	@ts=$$(date -u +%Y%m%dT%H%M%SZ); \
+	out="$(TARGET_DIR)/benchmarks/results/sm2-$$ts.txt"; \
+	latest="$(TARGET_DIR)/benchmarks/results/sm2-latest.txt"; \
+	{ \
+		echo "timestamp=$$ts"; \
+		echo "git_rev=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+		$(TARGET_DIR)/benchmarks/bench_sm2; \
+	} | tee "$$out" | tee "$$latest"
+
+$(TARGET_DIR)/benchmarks/%: benchmarks/%.c $(TARGET_DIR)/libsimple_gmsm.a
 	$(CC) $(CFLAGS) -o $@ $< $(TARGET_DIR)/libsimple_gmsm.a -lm
 
 clean:

@@ -40,8 +40,20 @@ transport layer protocol.
 # 构建静态库(.a) 和动态库(.so)
 make libsimple_gmsm
 
-# 运行所有单元测试 (56 个测试用例)
+# 运行所有单元测试 (61 个测试用例)
 make test
+
+# 运行 bigint 基准
+make bench-bigint
+
+# 运行 SM2 基准
+make bench-sm2
+
+# 运行并保存一份带时间戳的 bigint 基准结果
+make bench-bigint-save
+
+# 运行并保存一份带时间戳的 SM2 基准结果
+make bench-sm2-save
 
 # 编译示例程序
 make examples
@@ -176,6 +188,22 @@ zuc_eea3(key, count, bearer, direction, plain, cipher, bitlen);
 > 💡 完整可运行的示例见 `examples/` 目录，使用 `make examples` 编译。
 
 ## API 参考 / API Reference
+
+## 性能跟踪 / Performance Tracking
+
+项目内置了 bigint 和 SM2 微基准，便于持续观察底层大数和椭圆曲线热点操作的变化：
+
+```bash
+# 当前版本直接跑一遍
+make bench-bigint
+make bench-sm2
+
+# 保存带时间戳的结果到 target/benchmarks/results/
+make bench-bigint-save
+make bench-sm2-save
+```
+
+`bench-bigint-save` 和 `bench-sm2-save` 会分别生成对应的 `*-latest.txt` 与带 UTC 时间戳的历史结果，方便你在本地长期积累数据，后续可以直接对比 `ns_per_op` 指标。
 
 ### 头文件
 

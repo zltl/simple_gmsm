@@ -55,6 +55,8 @@ typedef uint64_t big_dlimb_t;
 struct big_p {
     /// 符号: 0 表示零, 1 表示正数, -1 表示负数
     int sign;
+    /// 已使用的 limb 数量，0 表示数值为 0
+    uint8_t used;
     /// limb 数组, limbs[0] 为最低有效字
     big_limb_t limbs[BIG_LIMBS];
 };

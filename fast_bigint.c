@@ -44,7 +44,13 @@ big_t big_three;
 
 static void __set_zero(big_t* a) {
     a->sign = 0;
+    a->used = 0;
     memset(a->limbs, 0, sizeof(a->limbs));
+}
+
+static void __set_used_sign(big_t* a, int used, int sign) {
+    a->used = (uint8_t)used;
+    a->sign = (used > 0) ? ((sign < 0) ? -1 : 1) : 0;
 }
 
 /// 返回有效 limb 数量 (最高非零 limb 的索引 + 1)
@@ -66,30 +72,82 @@ static int __limbs_cmp(const big_limb_t* a, const big_limb_t* b, int n) {
     return 0;
 }
 
-/// 无符号加法: c = a + b, 返回进位
-static big_limb_t __limbs_add(big_limb_t* c, const big_limb_t* a,
-                              const big_limb_t* b, int n) {
+/// 按有效 limb 数比较两个无符号整数
+static int __limbs_cmp_var(const big_limb_t* a, int alen,
+                           const big_limb_t* b, int blen) {
+    if (alen != blen) {
+        return (alen > blen) ? 1 : -1;
+    }
+    return __limbs_cmp(a, b, alen);
+}
+
+/// 无符号加法，按有效 limb 数运算，返回结果长度
+static int __limbs_add_var(big_limb_t* c, const big_limb_t* a, int alen,
+                           const big_limb_t* b, int blen) {
     big_limb_t carry = 0;
     int i;
-    for (i = 0; i < n; i++) {
+    int min = (alen < blen) ? alen : blen;
+
+    for (i = 0; i < min; i++) {
         big_dlimb_t sum = (big_dlimb_t)a[i] + b[i] + carry;
         c[i] = (big_limb_t)sum;
         carry = (big_limb_t)(sum >> BIG_LIMB_BITS);
     }
-    return carry;
+
+    if (alen > blen) {
+        for (; i < alen; i++) {
+            big_dlimb_t sum = (big_dlimb_t)a[i] + carry;
+            c[i] = (big_limb_t)sum;
+            carry = (big_limb_t)(sum >> BIG_LIMB_BITS);
+        }
+    } else {
+        for (; i < blen; i++) {
+            big_dlimb_t sum = (big_dlimb_t)b[i] + carry;
+            c[i] = (big_limb_t)sum;
+            carry = (big_limb_t)(sum >> BIG_LIMB_BITS);
+        }
+    }
+
+    if (carry != 0 && i < BIG_LIMBS) {
+        c[i++] = carry;
+    }
+    if (i < BIG_LIMBS) {
+        memset(c + i, 0,
+               (unsigned long)(BIG_LIMBS - i) * sizeof(big_limb_t));
+    }
+    return i;
 }
 
-/// 无符号减法: c = a - b, 返回借位 (0 或 1)
-static big_limb_t __limbs_sub(big_limb_t* c, const big_limb_t* a,
-                              const big_limb_t* b, int n) {
+/// 无符号减法，按有效 limb 数运算，要求 a >= b，返回结果长度
+static int __limbs_sub_var(big_limb_t* c, const big_limb_t* a, int alen,
+                           const big_limb_t* b, int blen) {
     big_limb_t borrow = 0;
     int i;
-    for (i = 0; i < n; i++) {
+    int used;
+
+    for (i = 0; i < blen; i++) {
         big_dlimb_t diff = (big_dlimb_t)a[i] - b[i] - borrow;
         c[i] = (big_limb_t)diff;
         borrow = (big_limb_t)((diff >> BIG_LIMB_BITS) != 0);
     }
-    return borrow;
+    for (; i < alen; i++) {
+        big_dlimb_t diff = (big_dlimb_t)a[i] - borrow;
+        c[i] = (big_limb_t)diff;
+        borrow = (big_limb_t)((diff >> BIG_LIMB_BITS) != 0);
+    }
+
+    if (i < BIG_LIMBS) {
+        memset(c + i, 0,
+               (unsigned long)(BIG_LIMBS - i) * sizeof(big_limb_t));
+    }
+
+    used = alen;
+    while (used > 0 && c[used - 1] == 0) used--;
+    return used;
+}
+
+static int __big_odd(const big_t* a) {
+    return (a->used > 0) ? (int)(a->limbs[0] & 1) : 0;
 }
 
 /// limb 前导零计数
@@ -268,235 +326,103 @@ static void __big_divmod(big_limb_t* q, big_limb_t* r,
     }
 }
 
-/* ================================================================== */
-/*  Public API                                                         */
-/* ================================================================== */
-
-void big_prepare(void) {
-    __set_zero(&big_zero);
-    __set_zero(&big_one);
-    __set_zero(&big_two);
-    __set_zero(&big_three);
-    big_one.sign = 1;
-    big_two.sign = 1;
-    big_three.sign = 1;
-    big_one.limbs[0] = 1;
-    big_two.limbs[0] = 2;
-    big_three.limbs[0] = 3;
-}
-
-void big_finished(void) {}
-
-void big_init(big_t* a) {
-    a->sign = 0;
-    {
-        unsigned char* raw = (unsigned char*)a->limbs;
-        int idx = __rand_fn(0) % (int)sizeof(a->limbs);
-        __rand_fn((long)raw[idx]);
-    }
-}
-
-void big_destroy(big_t* a) {
-    {
-        unsigned char* raw = (unsigned char*)a->limbs;
-        int idx = __rand_fn(0) % (int)sizeof(a->limbs);
-        __rand_fn((long)raw[idx]);
-    }
-    a->sign = 0;
-}
-
-void big_set(big_t* a, const big_t* b) {
-    a->sign = b->sign;
-    memcpy(a->limbs, b->limbs, sizeof(a->limbs));
-}
-
-void big_swap(big_t* a, big_t* b) {
-    big_t t;
-    big_set(&t, a);
-    big_set(a, b);
-    big_set(b, &t);
-}
-
-int big_cmp(const big_t* a, const big_t* b) {
-    int r;
-    if (a->sign != b->sign) {
-        return a->sign - b->sign;
-    }
-    if (a->sign == 0) {
-        return -1 * b->sign;
-    }
-    if (b->sign == 0) {
-        return a->sign;
-    }
-    r = __limbs_cmp(a->limbs, b->limbs, BIG_LIMBS);
-    if (a->sign < 0) {
-        return -1 * r;
-    }
-    return r;
-}
-
-void big_add(big_t* c, const big_t* a, const big_t* b) {
-    int cmp;
-
-    if (a->sign == 0) { big_set(c, b); return; }
-    if (b->sign == 0) { big_set(c, a); return; }
-
-    /* 同号: 绝对值相加 */
-    if (a->sign == b->sign) {
-        __limbs_add(c->limbs, a->limbs, b->limbs, BIG_LIMBS);
-        c->sign = a->sign;
-        return;
-    }
-
-    /* 异号: |大| - |小| */
-    cmp = __limbs_cmp(a->limbs, b->limbs, BIG_LIMBS);
-    if (cmp == 0) {
-        __set_zero(c);
-        return;
-    }
-    if (cmp < 0) {
-        __limbs_sub(c->limbs, b->limbs, a->limbs, BIG_LIMBS);
-    } else {
-        __limbs_sub(c->limbs, a->limbs, b->limbs, BIG_LIMBS);
-    }
-    c->sign = a->sign * cmp;
-}
-
-void big_sub(big_t* c, const big_t* a, const big_t* b) {
-    int cmp;
-
-    if (a->sign == 0) {
-        big_set(c, b);
-        c->sign = -b->sign;
-        return;
-    }
-    if (b->sign == 0) {
-        big_set(c, a);
-        return;
-    }
-
-    /* 异号: 绝对值相加 */
-    if (a->sign != b->sign) {
-        __limbs_add(c->limbs, a->limbs, b->limbs, BIG_LIMBS);
-        c->sign = (a->sign > 0) ? 1 : -1;
-        return;
-    }
-
-    /* 同号: |大| - |小|, 确定结果符号 */
-    cmp = __limbs_cmp(a->limbs, b->limbs, BIG_LIMBS);
-    if (cmp == 0) {
-        __set_zero(c);
-        return;
-    }
-    if (cmp > 0) {
-        __limbs_sub(c->limbs, a->limbs, b->limbs, BIG_LIMBS);
-        c->sign = (a->sign == -1) ? -1 : 1;
-    } else {
-        __limbs_sub(c->limbs, b->limbs, a->limbs, BIG_LIMBS);
-        c->sign = (a->sign == -1) ? 1 : -1;
-    }
-}
-
-void big_mul(big_t* c, const big_t* a, const big_t* b) {
-    big_limb_t tmp[2 * BIG_LIMBS];
-    int i, j, alen, blen;
-
-    if (a->sign == 0 || b->sign == 0) {
-        __set_zero(c);
-        return;
-    }
-
-    alen = __limbs_len(a->limbs, BIG_LIMBS);
-    blen = __limbs_len(b->limbs, BIG_LIMBS);
-
-    memset(tmp, 0, sizeof(tmp));
-
-    for (i = 0; i < alen; i++) {
-        big_limb_t carry = 0;
-        for (j = 0; j < blen; j++) {
-            big_dlimb_t prod = (big_dlimb_t)a->limbs[i] * b->limbs[j]
-                               + tmp[i + j] + carry;
-            tmp[i + j] = (big_limb_t)prod;
-            carry = (big_limb_t)(prod >> BIG_LIMB_BITS);
-        }
-        tmp[i + blen] = carry;
-    }
-
-    c->sign = a->sign * b->sign;
-    memcpy(c->limbs, tmp, sizeof(c->limbs));
-}
-
-void big_div(big_t* c, const big_t* a, const big_t* b) {
-    big_t r;
+static void __big_divmod_big(big_t* q, big_t* r,
+                             const big_t* a, const big_t* b) {
     big_limb_t ql[BIG_LIMBS];
-    big_limb_t al[BIG_LIMBS];
-    int ulen, vlen;
-
-    if (a->sign == 0) { __set_zero(c); return; }
-
-    /* 拷贝 a 以支持 c == a 的别名情况 */
-    memcpy(al, a->limbs, sizeof(al));
-    ulen = __limbs_len(al, BIG_LIMBS);
-    vlen = __limbs_len(b->limbs, BIG_LIMBS);
-
-    memset(ql, 0, sizeof(ql));
-    memset(r.limbs, 0, sizeof(r.limbs));
-
-    __big_divmod(ql, r.limbs, al, ulen, b->limbs, vlen);
-
-    memcpy(c->limbs, ql, sizeof(c->limbs));
-    c->sign = a->sign * b->sign;
-    if (__limbs_len(c->limbs, BIG_LIMBS) == 0) c->sign = 0;
-}
-
-void big_mod(big_t* c, const big_t* a, const big_t* b) {
-    big_limb_t q[BIG_LIMBS];
     big_limb_t rl[BIG_LIMBS];
     big_limb_t al[BIG_LIMBS];
-    int ulen, vlen;
+    int ulen, vlen, qlen, rlen;
+    int cmp;
 
-    if (a->sign == 0) { __set_zero(c); return; }
+    if (a->sign == 0 || a->used == 0 || b->sign == 0 || b->used == 0) {
+        if (q != NULL) __set_zero(q);
+        if (r != NULL) __set_zero(r);
+        return;
+    }
 
-    /* 拷贝 a 以支持 c == a 的别名情况 */
+    ulen = a->used;
+    vlen = b->used;
+
+    cmp = __limbs_cmp_var(a->limbs, ulen, b->limbs, vlen);
+    if (cmp < 0) {
+        if (q != NULL) __set_zero(q);
+        if (r != NULL) big_set(r, a);
+        return;
+    }
+    if (cmp == 0) {
+        if (q != NULL) {
+            __set_zero(q);
+            q->limbs[0] = 1;
+            __set_used_sign(q, 1, a->sign * b->sign);
+        }
+        if (r != NULL) __set_zero(r);
+        return;
+    }
+
     memcpy(al, a->limbs, sizeof(al));
-    ulen = __limbs_len(al, BIG_LIMBS);
-    vlen = __limbs_len(b->limbs, BIG_LIMBS);
 
-    memset(q, 0, sizeof(q));
+    memset(ql, 0, sizeof(ql));
     memset(rl, 0, sizeof(rl));
 
-    __big_divmod(q, rl, al, ulen, b->limbs, vlen);
+    __big_divmod(ql, rl, al, ulen, b->limbs, vlen);
 
-    memcpy(c->limbs, rl, sizeof(c->limbs));
-    c->sign = (__limbs_len(c->limbs, BIG_LIMBS) > 0) ? 1 : 0;
+    qlen = __limbs_len(ql, BIG_LIMBS);
+    rlen = __limbs_len(rl, BIG_LIMBS);
+
+    if (q != NULL) {
+        memcpy(q->limbs, ql, sizeof(q->limbs));
+        __set_used_sign(q, qlen, a->sign * b->sign);
+    }
+    if (r != NULL) {
+        memcpy(r->limbs, rl, sizeof(r->limbs));
+        __set_used_sign(r, rlen, 1);
+    }
 }
 
-int big_inv(big_t* x, const big_t* _a, const big_t* m) {
-    big_t m0, tty, ty, t, y, a, q;
+static int __big_inv_euclid(big_t* x, const big_t* a_in, const big_t* m) {
+    big_t m0, tty, ty, t, y, a, q, rem;
 
     big_init(&m0);
     big_init(&tty);
     big_init(&ty);
     big_init(&t);
+    big_init(&y);
     big_init(&a);
     big_init(&q);
+    big_init(&rem);
 
     big_set(&m0, m);
     big_set(&ty, &big_zero);
     big_set(&y, &big_zero);
     big_set(x, &big_one);
-    big_set(&a, _a);
+    big_set(&a, a_in);
     if (big_cmp(&m0, &big_one) == 0) {
+        big_destroy(&m0);
+        big_destroy(&tty);
+        big_destroy(&ty);
+        big_destroy(&t);
+        big_destroy(&y);
+        big_destroy(&a);
+        big_destroy(&q);
+        big_destroy(&rem);
         return 0;
     }
 
     while (big_cmp(&a, &big_one) > 0) {
         if (big_cmp(&m0, &big_zero) == 0) {
+            big_destroy(&m0);
+            big_destroy(&tty);
+            big_destroy(&ty);
+            big_destroy(&t);
+            big_destroy(&y);
+            big_destroy(&a);
+            big_destroy(&q);
+            big_destroy(&rem);
             return 0;
         }
-        big_div(&q, &a, &m0);
+        __big_divmod_big(&q, &rem, &a, &m0);
         big_set(&t, &m0);
-        big_mod(&m0, &a, &t);
+        big_set(&m0, &rem);
         big_set(&a, &t);
         big_set(&t, &y);
         big_mul(&tty, &q, &y);
@@ -514,18 +440,216 @@ int big_inv(big_t* x, const big_t* _a, const big_t* m) {
     big_destroy(&tty);
     big_destroy(&ty);
     big_destroy(&t);
+    big_destroy(&y);
     big_destroy(&a);
     big_destroy(&q);
+    big_destroy(&rem);
 
     return 1;
+}
+
+/* ================================================================== */
+/*  Public API                                                         */
+/* ================================================================== */
+
+void big_prepare(void) {
+    __set_zero(&big_zero);
+    __set_zero(&big_one);
+    __set_zero(&big_two);
+    __set_zero(&big_three);
+    big_one.sign = 1;
+    big_two.sign = 1;
+    big_three.sign = 1;
+    big_one.used = 1;
+    big_two.used = 1;
+    big_three.used = 1;
+    big_one.limbs[0] = 1;
+    big_two.limbs[0] = 2;
+    big_three.limbs[0] = 3;
+}
+
+void big_finished(void) {}
+
+void big_init(big_t* a) {
+    a->sign = 0;
+    a->used = 0;
+    {
+        unsigned char* raw = (unsigned char*)a->limbs;
+        int idx = __rand_fn(0) % (int)sizeof(a->limbs);
+        __rand_fn((long)raw[idx]);
+    }
+}
+
+void big_destroy(big_t* a) {
+    {
+        unsigned char* raw = (unsigned char*)a->limbs;
+        int idx = __rand_fn(0) % (int)sizeof(a->limbs);
+        __rand_fn((long)raw[idx]);
+    }
+    a->sign = 0;
+    a->used = 0;
+}
+
+void big_set(big_t* a, const big_t* b) {
+    a->sign = b->sign;
+    a->used = b->used;
+    memcpy(a->limbs, b->limbs, sizeof(a->limbs));
+}
+
+void big_swap(big_t* a, big_t* b) {
+    big_t t;
+    big_set(&t, a);
+    big_set(a, b);
+    big_set(b, &t);
+}
+
+int big_cmp(const big_t* a, const big_t* b) {
+    int alen, blen;
+    int r;
+    if (a->sign != b->sign) {
+        return a->sign - b->sign;
+    }
+    if (a->sign == 0) {
+        return -1 * b->sign;
+    }
+    if (b->sign == 0) {
+        return a->sign;
+    }
+
+    alen = a->used;
+    blen = b->used;
+    r = __limbs_cmp_var(a->limbs, alen, b->limbs, blen);
+    if (a->sign < 0) {
+        return -1 * r;
+    }
+    return r;
+}
+
+void big_add(big_t* c, const big_t* a, const big_t* b) {
+    int alen, blen;
+    int cmp;
+    int used;
+
+    if (a->sign == 0) { big_set(c, b); return; }
+    if (b->sign == 0) { big_set(c, a); return; }
+
+    alen = a->used;
+    blen = b->used;
+
+    /* 同号: 绝对值相加 */
+    if (a->sign == b->sign) {
+        used = __limbs_add_var(c->limbs, a->limbs, alen, b->limbs, blen);
+        __set_used_sign(c, used, a->sign);
+        return;
+    }
+
+    /* 异号: |大| - |小| */
+    cmp = __limbs_cmp_var(a->limbs, alen, b->limbs, blen);
+    if (cmp == 0) {
+        __set_zero(c);
+        return;
+    }
+    if (cmp < 0) {
+        used = __limbs_sub_var(c->limbs, b->limbs, blen, a->limbs, alen);
+        __set_used_sign(c, used, b->sign);
+    } else {
+        used = __limbs_sub_var(c->limbs, a->limbs, alen, b->limbs, blen);
+        __set_used_sign(c, used, a->sign);
+    }
+}
+
+void big_sub(big_t* c, const big_t* a, const big_t* b) {
+    int alen, blen;
+    int cmp;
+    int used;
+
+    if (a->sign == 0) {
+        big_set(c, b);
+        c->sign = -b->sign;
+        return;
+    }
+    if (b->sign == 0) {
+        big_set(c, a);
+        return;
+    }
+
+    alen = a->used;
+    blen = b->used;
+
+    /* 异号: 绝对值相加 */
+    if (a->sign != b->sign) {
+        used = __limbs_add_var(c->limbs, a->limbs, alen, b->limbs, blen);
+        __set_used_sign(c, used, (a->sign > 0) ? 1 : -1);
+        return;
+    }
+
+    /* 同号: |大| - |小|, 确定结果符号 */
+    cmp = __limbs_cmp_var(a->limbs, alen, b->limbs, blen);
+    if (cmp == 0) {
+        __set_zero(c);
+        return;
+    }
+    if (cmp > 0) {
+        used = __limbs_sub_var(c->limbs, a->limbs, alen, b->limbs, blen);
+        __set_used_sign(c, used, a->sign);
+    } else {
+        used = __limbs_sub_var(c->limbs, b->limbs, blen, a->limbs, alen);
+        __set_used_sign(c, used, -a->sign);
+    }
+}
+
+void big_mul(big_t* c, const big_t* a, const big_t* b) {
+    big_limb_t tmp[2 * BIG_LIMBS];
+    int i, j, alen, blen, used;
+
+    if (a->sign == 0 || b->sign == 0) {
+        __set_zero(c);
+        return;
+    }
+
+    alen = a->used;
+    blen = b->used;
+
+    memset(tmp, 0, sizeof(tmp));
+
+    for (i = 0; i < alen; i++) {
+        big_limb_t carry = 0;
+        for (j = 0; j < blen; j++) {
+            big_dlimb_t prod = (big_dlimb_t)a->limbs[i] * b->limbs[j]
+                               + tmp[i + j] + carry;
+            tmp[i + j] = (big_limb_t)prod;
+            carry = (big_limb_t)(prod >> BIG_LIMB_BITS);
+        }
+        tmp[i + blen] = carry;
+    }
+
+    memcpy(c->limbs, tmp, sizeof(c->limbs));
+    used = alen + blen;
+    if (used > BIG_LIMBS) used = BIG_LIMBS;
+    while (used > 0 && c->limbs[used - 1] == 0) used--;
+    __set_used_sign(c, used, a->sign * b->sign);
+}
+
+void big_div(big_t* c, const big_t* a, const big_t* b) {
+    __big_divmod_big(c, NULL, a, b);
+}
+
+void big_mod(big_t* c, const big_t* a, const big_t* b) {
+    __big_divmod_big(NULL, c, a, b);
+}
+
+int big_inv(big_t* x, const big_t* _a, const big_t* m) {
+    return __big_inv_euclid(x, _a, m);
 }
 
 void big_from_bytes(big_t* a, unsigned char* buf, long buf_len) {
     long i;
     long max_bytes = (long)(BIG_LIMBS * BIG_LIMB_BYTES);
+    int used;
 
     memset(a->limbs, 0, sizeof(a->limbs));
-    a->sign = 1;
+    a->sign = 0;
+    a->used = 0;
 
     /* buf 是大端序: buf[0]=MSB, buf[buf_len-1]=LSB */
     /* limbs 是小端序: limbs[0]=最低有效字 */
@@ -535,14 +659,22 @@ void big_from_bytes(big_t* a, unsigned char* buf, long buf_len) {
         a->limbs[limb_idx] |=
             (big_limb_t)buf[buf_len - 1 - i] << bit_shift;
     }
+
+    used = __limbs_len(a->limbs, BIG_LIMBS);
+    __set_used_sign(a, used, 1);
 }
 
 void big_to_bytes(unsigned char* buf, unsigned long* buf_len,
                   const big_t* a) {
-    int total_bytes = BIG_LIMBS * BIG_LIMB_BYTES;
+    int total_bytes = a->used * BIG_LIMB_BYTES;
     unsigned char temp[BIG_LIMBS * BIG_LIMB_BYTES];
     int i, start;
     unsigned long j, out_len;
+
+    if (a->used == 0) {
+        *buf_len = 0;
+        return;
+    }
 
     /* limbs 转大端序字节 */
     for (i = 0; i < total_bytes; i++) {
@@ -569,16 +701,19 @@ void big_rand(big_t* a, unsigned long n) {
     unsigned long i;
     unsigned long max_bytes = BIG_LIMBS * BIG_LIMB_BYTES;
     unsigned char* raw;
+    int used;
 
     __set_zero(a);
-    a->sign = 1;
 
     raw = (unsigned char*)a->limbs;
     for (i = 0; i < n && i < max_bytes; i++) {
         raw[i] = __rand_fn((long)(uintptr_t)a->limbs);
     }
+
+    used = __limbs_len(a->limbs, BIG_LIMBS);
+    __set_used_sign(a, used, 1);
 }
 
 int big_odd_p(big_t* a) {
-    return (int)(a->limbs[0] & 1);
+    return __big_odd(a);
 }

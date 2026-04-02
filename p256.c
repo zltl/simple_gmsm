@@ -1,6 +1,10 @@
 #include "simple_gmsm/sm2.h"
 #include "simple_gmsm/big.h"
 
+#ifndef USE_SLOW_BIGINT
+#include "montgomery.h"
+#endif
+
 #define SM2_MAX_BIG_BYTES 70
 
 /* 参数定义 */
@@ -61,117 +65,131 @@ big_t sm2_p, sm2_a, sm2_b, sm2_n, sm2_gx, sm2_gy;
 big_t sm2_d_max;
 big_t sm2_2w, sm2_2w_1;
 
-void sm2_init(void) {
-    big_init(&sm2_p);
-    big_init(&sm2_a);
-    big_init(&sm2_b);
-    big_init(&sm2_n);
-    big_init(&sm2_gx);
-    big_init(&sm2_gy);
-    big_init(&sm2_d_max);
-    big_init(&sm2_2w);
-    big_init(&sm2_2w_1);
+#ifndef USE_SLOW_BIGINT
+static sgmsm_mont_ctx_t sm2_fp_ctx;
+static big_t sm2_a_field;
+static big_t sm2_b_field;
+#endif
 
-    big_from_bytes(&sm2_p, _p, sizeof(_p));
-    big_from_bytes(&sm2_a, _a, sizeof(_a));
-    big_from_bytes(&sm2_b, _b, sizeof(_b));
-    big_from_bytes(&sm2_n, _n, sizeof(_n));
-    big_from_bytes(&sm2_gx, _gx, sizeof(_gx));
-    big_from_bytes(&sm2_gy, _gy, sizeof(_gy));
-    big_sub(&sm2_d_max, &sm2_n, &big_two);  // private key d in [1, n-2]
-    big_from_bytes(&sm2_2w, _2w, sizeof(_2w));
-    big_from_bytes(&sm2_2w_1, _2w_1, sizeof(_2w_1));
+static void sm2_fp_from_std(big_t* out, const big_t* a) {
+#ifndef USE_SLOW_BIGINT
+    sgmsm_mont_from_std(out, a, &sm2_fp_ctx);
+#else
+    big_set(out, a);
+#endif
 }
 
-void sm2_destroy(void) {
-    big_destroy(&sm2_p);
-    big_destroy(&sm2_a);
-    big_destroy(&sm2_b);
-    big_destroy(&sm2_n);
-    big_destroy(&sm2_gx);
-    big_destroy(&sm2_gy);
-    big_destroy(&sm2_d_max);
+static void sm2_fp_to_std(big_t* out, const big_t* a) {
+#ifndef USE_SLOW_BIGINT
+    sgmsm_mont_to_std(out, a, &sm2_fp_ctx);
+#else
+    big_set(out, a);
+#endif
 }
-// This file operates, internally, on Jacobian coordinates. For a given
-// (x, y) position on the curve, the Jacobian coordinates are (x1, y1, z1)
-// where x = x1/z1² and y = y1/z1³. The greatest speedups come when the whole
-// calculation can be performed within the transform. But even for Add and
-// Double, it's faster to apply and reverse the transform than to operate
-// in affine coordinates.
 
-// returns a Jacobian Z value for the affine point (x, y)
-// usually we use (x, y, 1) as Jacobian point because it's easy to get.
-// value (4x, 8y, 2) or (9x, 27y, 3) are alternative, but hard to generate.
-// If x and y are zero, it assumes that they represent the point at infinity
-// because (0, 0) is not on the any of the curves handled here.
-void sm2_get_jacobian_z(big_t* z, const big_t* x, const big_t* y) {
+static void sm2_fp_set_one(big_t* out) {
+#ifndef USE_SLOW_BIGINT
+    big_set(out, &sm2_fp_ctx.one);
+#else
+    big_set(out, &big_one);
+#endif
+}
+
+static void sm2_fp_add(big_t* out, const big_t* a, const big_t* b) {
+    big_add(out, a, b);
+    if (big_cmp(out, &sm2_p) >= 0) {
+        big_sub(out, out, &sm2_p);
+    }
+}
+
+static void sm2_fp_sub(big_t* out, const big_t* a, const big_t* b) {
+    big_sub(out, a, b);
+    if (big_cmp(out, &big_zero) < 0) {
+        big_add(out, out, &sm2_p);
+    }
+}
+
+static void sm2_fp_mul(big_t* out, const big_t* a, const big_t* b) {
+#ifndef USE_SLOW_BIGINT
+    sgmsm_mont_mul(out, a, b, &sm2_fp_ctx);
+#else
+    SM_STATIC big_t tmp;
+
+    big_init(&tmp);
+    big_mul(&tmp, a, b);
+    big_mod(out, &tmp, &sm2_p);
+    big_destroy(&tmp);
+#endif
+}
+
+static void sm2_fp_sqr(big_t* out, const big_t* a) {
+#ifndef USE_SLOW_BIGINT
+    sgmsm_mont_sqr(out, a, &sm2_fp_ctx);
+#else
+    sm2_fp_mul(out, a, a);
+#endif
+}
+
+static void sm2_fp_inv(big_t* out, const big_t* a) {
+#ifndef USE_SLOW_BIGINT
+    sgmsm_mont_inv(out, a, &sm2_fp_ctx);
+#else
+    big_inv(out, a, &sm2_p);
+#endif
+}
+
+static void sm2_get_jacobian_z_field(big_t* z, const big_t* x,
+                                     const big_t* y) {
     if (big_cmp(x, &big_zero) != 0 && big_cmp(y, &big_zero) != 0) {
-        big_set(z, &big_one);
+        sm2_fp_set_one(z);
     } else {
         big_set(z, &big_zero);
     }
 }
 
-// reverses the Jacobian transform.If the point is ∞ it returns 0, 0.
-void sm2_jacobian_to_affine(big_t* xout, big_t* yout, const big_t* x,
-                            const big_t* y, const big_t* z) {
-    SM_STATIC big_t zinv, zinvsq, tmp;
+static void sm2_double_jacobian_field(big_t* x3, big_t* y3, big_t* z3,
+                                      const big_t* x1, const big_t* y1,
+                                      const big_t* z1);
+
+static void sm2_jacobian_to_affine_field(big_t* xout, big_t* yout,
+                                         const big_t* x, const big_t* y,
+                                         const big_t* z) {
+    SM_STATIC big_t zinv, zinvsq, zinvcu, rx, ry;
 
     if (big_cmp(z, &big_zero) == 0) {
         big_set(xout, &big_zero);
         big_set(yout, &big_zero);
         return;
     }
-    // x=X/Z^2
-    // y=Y/Z^3
+
     big_init(&zinv);
     big_init(&zinvsq);
-    big_init(&tmp);
+    big_init(&zinvcu);
+    big_init(&rx);
+    big_init(&ry);
 
-    // big_hexp("z", z);
-    // big_hexp("p", &sm2_p);
-    big_inv(&zinv, z, &sm2_p);
-    big_mul(&tmp, &zinv, &zinv);
-    big_mod(&zinvsq, &tmp, &sm2_p);  // z^2 mod p
-    big_mul(&tmp, x, &zinvsq);
-    big_mod(xout, &tmp, &sm2_p);
-    big_mul(&tmp, &zinvsq, &zinv);
-    big_mod(&zinvsq, &tmp, &sm2_p);  // z^3 mod p
-    big_mul(&tmp, y, &zinvsq);
-    big_mod(yout, &tmp, &sm2_p);
+    sm2_fp_inv(&zinv, z);
+    sm2_fp_sqr(&zinvsq, &zinv);
+    sm2_fp_mul(&rx, x, &zinvsq);
+    sm2_fp_mul(&zinvcu, &zinvsq, &zinv);
+    sm2_fp_mul(&ry, y, &zinvcu);
+
+    sm2_fp_to_std(xout, &rx);
+    sm2_fp_to_std(yout, &ry);
 
     big_destroy(&zinv);
     big_destroy(&zinvsq);
-    big_destroy(&tmp);
+    big_destroy(&zinvcu);
+    big_destroy(&rx);
+    big_destroy(&ry);
 }
 
-// takes two points in Jacobian coordinates, (x1, y1, z1) and
-// (x2, y2, z2) and returns their sum, in Jacobian form.
-// See
-// https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html#addition-add-2007-bl
-/*
-      Z1Z1 = Z1^2
-      Z2Z2 = Z2^2
-      U1 = X1*Z2Z2
-      U2 = X2*Z1Z1
-      S1 = Y1*Z2*Z2Z2
-      S2 = Y2*Z1*Z1Z1
-      H = U2-U1
-      I = (2*H)^2
-      J = H*I
-      r = 2*(S2-S1)
-      V = U1*I
-      X3 = r^2-J-2*V
-      Y3 = r*(V-X3)-2*S1*J
-      Z3 = ((Z1+Z2)^2-Z1Z1-Z2Z2)*H
-*/
-void sm2_add_jocabian(big_t* x3, big_t* y3, big_t* z3, const big_t* x1,
-                      const big_t* y1, const big_t* z1, const big_t* x2,
-                      const big_t* y2, const big_t* z2) {
+static void sm2_add_jacobian_field(big_t* x3, big_t* y3, big_t* z3,
+                                   const big_t* x1, const big_t* y1,
+                                   const big_t* z1, const big_t* x2,
+                                   const big_t* y2, const big_t* z2) {
     SM_STATIC big_t z1z1, z2z2, u1, u2, s1, s2, h, i, j, r, v;
     SM_STATIC big_t tmp1, tmp2;
-    int xequal = 0, yequal = 0;
-    int cmpr;
 
     if (big_cmp(z1, &big_zero) == 0) {
         big_set(x3, x2);
@@ -200,103 +218,68 @@ void sm2_add_jocabian(big_t* x3, big_t* y3, big_t* z3, const big_t* x1,
     big_init(&tmp1);
     big_init(&tmp2);
 
-    big_mul(&tmp1, z1, z1);
-    big_mod(&z1z1, &tmp1, &sm2_p);  // Z1Z1 = Z1^2
-    big_mul(&tmp1, z2, z2);
-    big_mod(&z2z2, &tmp1, &sm2_p);  // Z2Z2 = Z2^2
+    sm2_fp_sqr(&z1z1, z1);
+    sm2_fp_sqr(&z2z2, z2);
+    sm2_fp_mul(&u1, x1, &z2z2);
+    sm2_fp_mul(&u2, x2, &z1z1);
 
-    big_mul(&tmp1, x1, &z2z2);
-    big_mod(&u1, &tmp1, &sm2_p);  // U1 = X1*Z2Z2
-    big_mul(&tmp1, x2, &z1z1);
-    big_mod(&u2, &tmp1, &sm2_p);  // U2 = X2*Z1Z1
+    sm2_fp_mul(&tmp1, y1, z2);
+    sm2_fp_mul(&s1, &tmp1, &z2z2);
+    sm2_fp_mul(&tmp1, y2, z1);
+    sm2_fp_mul(&s2, &tmp1, &z1z1);
 
-    big_mul(&tmp1, y1, z2);
-    big_mod(&s1, &tmp1, &sm2_p);
-    big_mul(&tmp1, &s1, &z2z2);
-    big_mod(&s1, &tmp1, &sm2_p);  // S1 = Y1*Z2*Z2Z2
-    big_mul(&tmp1, y2, z1);
-    big_mod(&s2, &tmp1, &sm2_p);
-    big_mul(&tmp1, &s2, &z1z1);
-    big_mod(&s2, &tmp1, &sm2_p);  // S2 = Y2*Z1*Z1Z1
+    if (big_cmp(&u1, &u2) == 0) {
+        int points_equal = (big_cmp(&s1, &s2) == 0);
 
-    big_sub(&tmp1, &u2, &u1);  // H = U2-U1
-    cmpr = big_cmp(&tmp1, &big_zero);
-    xequal = (cmpr == 0);
-    if (cmpr < 0) {
-        big_add(&h, &tmp1, &sm2_p);
-    } else {
-        big_set(&h, &tmp1);
-    }
+        big_destroy(&z1z1);
+        big_destroy(&z2z2);
+        big_destroy(&u1);
+        big_destroy(&u2);
+        big_destroy(&s1);
+        big_destroy(&s2);
+        big_destroy(&h);
+        big_destroy(&i);
+        big_destroy(&j);
+        big_destroy(&r);
+        big_destroy(&v);
+        big_destroy(&tmp1);
+        big_destroy(&tmp2);
 
-    big_add(&tmp1, &h, &h);
-    big_mod(&i, &tmp1, &sm2_p);
-    big_mul(&tmp1, &i, &i);
-    big_mod(&i, &tmp1, &sm2_p);  // I = (2*H)^2
-    big_mul(&tmp1, &h, &i);
-    big_mod(&j, &tmp1, &sm2_p);  // J = H*I
-
-    big_sub(&tmp1, &s2, &s1);
-    cmpr = big_cmp(&tmp1, &big_zero);
-    yequal = (cmpr == 0);
-
-    if (xequal && yequal) {
-        sm2_double_jacobian(x3, y3, z3, x1, y1, z1);
+        if (points_equal) {
+            sm2_double_jacobian_field(x3, y3, z3, x1, y1, z1);
+        } else {
+            big_set(x3, &big_zero);
+            big_set(y3, &big_zero);
+            big_set(z3, &big_zero);
+        }
         return;
     }
 
-    if (cmpr < 0) {
-        big_add(&r, &tmp1, &sm2_p);
-    } else {
-        big_set(&r, &tmp1);
-    }
-    big_add(&tmp1, &r, &r);
-    big_mod(&r, &tmp1, &sm2_p);  // r = 2*(S2-S1)
+    sm2_fp_sub(&h, &u2, &u1);
+    sm2_fp_add(&tmp1, &h, &h);
+    sm2_fp_sqr(&i, &tmp1);
+    sm2_fp_mul(&j, &h, &i);
 
-    big_mul(&tmp1, &u1, &i);
-    big_mod(&v, &tmp1, &sm2_p);  // V = U1*I
+    sm2_fp_sub(&tmp1, &s2, &s1);
+    sm2_fp_add(&r, &tmp1, &tmp1);
+    sm2_fp_mul(&v, &u1, &i);
 
-    // X3 = r^2-J-2*V
-    big_mul(&tmp1, &r, &r);
-    big_sub(x3, &tmp1, &j);
-    big_add(&tmp1, &v, &v);
-    big_sub(&tmp2, x3, &tmp1);
-    while (big_cmp(&tmp2, &big_zero) < 0) {
-        big_add(&tmp1, &tmp2, &sm2_p);
-        big_set(&tmp2, &tmp1);
-    }
-    big_mod(x3, &tmp2, &sm2_p);
+    sm2_fp_sqr(&tmp1, &r);
+    sm2_fp_add(&tmp2, &v, &v);
+    sm2_fp_sub(&tmp1, &tmp1, &j);
+    sm2_fp_sub(x3, &tmp1, &tmp2);
 
-    // Y3 = r*(V-X3)-2*S1*J
-    big_sub(&tmp1, &v, x3);
-    if (big_cmp(&tmp1, &big_zero) < 0) {
-        big_add(&tmp2, &tmp1, &sm2_p);
-        big_set(&tmp1, &tmp2);
-    }
-    big_mul(&tmp2, &r, &tmp1);
-    big_mod(y3, &tmp2, &sm2_p);  //  r*(V-X3)
-    big_add(&tmp1, &s1, &s1);
-    big_mod(&tmp2, &tmp1, &sm2_p);
-    big_mul(&tmp1, &tmp2, &j);
-    big_mod(&tmp2, &tmp1, &sm2_p);  // 2*S1*J
-    big_sub(&tmp1, y3, &tmp2);
-    if (big_cmp(&tmp1, &big_zero) < 0) {
-        big_add(y3, &tmp1, &sm2_p);
-    } else {
-        big_set(y3, &tmp1);
-    }
-    // Z3 = ((Z1+Z2)^2-Z1Z1-Z2Z2)*H
-    big_add(&tmp1, z1, z2);
-    big_mod(&tmp2, &tmp1, &sm2_p);
-    big_mul(&tmp1, &tmp2, &tmp2);
-    big_mod(z3, &tmp1, &sm2_p);  // (Z1+Z2)^2
-    big_sub(&tmp2, z3, &z1z1);
-    big_sub(&tmp1, &tmp2, &z2z2);
-    while (big_cmp(&tmp1, &big_zero) < 0) {
-        big_add(&tmp2, &tmp1, &sm2_p);
-        big_set(&tmp1, &tmp2);
-    }
-    big_mul(&tmp2, &tmp1, &h);
-    big_mod(z3, &tmp2, &sm2_p);
+    sm2_fp_sub(&tmp1, &v, x3);
+    sm2_fp_mul(&tmp2, &r, &tmp1);
+    sm2_fp_add(&tmp1, &s1, &s1);
+    sm2_fp_mul(&tmp1, &tmp1, &j);
+    sm2_fp_sub(y3, &tmp2, &tmp1);
+
+    sm2_fp_add(&tmp1, z1, z2);
+    sm2_fp_sqr(&tmp2, &tmp1);
+    sm2_fp_sub(&tmp2, &tmp2, &z1z1);
+    sm2_fp_sub(&tmp2, &tmp2, &z2z2);
+    sm2_fp_mul(z3, &tmp2, &h);
 
     big_destroy(&z1z1);
     big_destroy(&z2z2);
@@ -313,35 +296,247 @@ void sm2_add_jocabian(big_t* x3, big_t* y3, big_t* z3, const big_t* x1,
     big_destroy(&tmp2);
 }
 
+static void sm2_double_jacobian_field(big_t* x3, big_t* y3, big_t* z3,
+                                      const big_t* x1, const big_t* y1,
+                                      const big_t* z1) {
+    SM_STATIC big_t delta, gamma, beta, alpha, alpha2;
+    SM_STATIC big_t tmp1, tmp2;
+
+    if (big_cmp(z1, &big_zero) == 0 || big_cmp(y1, &big_zero) == 0) {
+        big_set(x3, &big_zero);
+        big_set(y3, &big_zero);
+        big_set(z3, &big_zero);
+        return;
+    }
+
+    big_init(&delta);
+    big_init(&gamma);
+    big_init(&beta);
+    big_init(&alpha);
+    big_init(&alpha2);
+    big_init(&tmp1);
+    big_init(&tmp2);
+
+    sm2_fp_sqr(&delta, z1);
+    sm2_fp_sqr(&gamma, y1);
+    sm2_fp_mul(&beta, x1, &gamma);
+
+    sm2_fp_sub(&tmp1, x1, &delta);
+    sm2_fp_add(&tmp2, x1, &delta);
+    sm2_fp_mul(&alpha, &tmp1, &tmp2);
+    sm2_fp_add(&tmp1, &alpha, &alpha);
+    sm2_fp_add(&alpha, &tmp1, &alpha);
+
+    sm2_fp_sqr(&alpha2, &alpha);
+    sm2_fp_add(&tmp1, &beta, &beta);
+    sm2_fp_add(&tmp1, &tmp1, &tmp1);
+    sm2_fp_add(&tmp1, &tmp1, &tmp1);
+    sm2_fp_sub(x3, &alpha2, &tmp1);
+
+    sm2_fp_add(&tmp1, y1, z1);
+    sm2_fp_sqr(&tmp2, &tmp1);
+    sm2_fp_sub(&tmp2, &tmp2, &gamma);
+    sm2_fp_sub(z3, &tmp2, &delta);
+
+    sm2_fp_add(&tmp1, &beta, &beta);
+    sm2_fp_add(&tmp1, &tmp1, &tmp1);
+    sm2_fp_sub(&tmp1, &tmp1, x3);
+    sm2_fp_mul(&tmp2, &alpha, &tmp1);
+
+    sm2_fp_sqr(&delta, &gamma);
+    sm2_fp_add(&tmp1, &delta, &delta);
+    sm2_fp_add(&tmp1, &tmp1, &tmp1);
+    sm2_fp_add(&tmp1, &tmp1, &tmp1);
+    sm2_fp_sub(y3, &tmp2, &tmp1);
+
+    big_destroy(&delta);
+    big_destroy(&gamma);
+    big_destroy(&beta);
+    big_destroy(&alpha);
+    big_destroy(&alpha2);
+    big_destroy(&tmp1);
+    big_destroy(&tmp2);
+}
+
+void sm2_init(void) {
+    big_init(&sm2_p);
+    big_init(&sm2_a);
+    big_init(&sm2_b);
+    big_init(&sm2_n);
+    big_init(&sm2_gx);
+    big_init(&sm2_gy);
+    big_init(&sm2_d_max);
+    big_init(&sm2_2w);
+    big_init(&sm2_2w_1);
+
+    big_from_bytes(&sm2_p, _p, sizeof(_p));
+    big_from_bytes(&sm2_a, _a, sizeof(_a));
+    big_from_bytes(&sm2_b, _b, sizeof(_b));
+    big_from_bytes(&sm2_n, _n, sizeof(_n));
+    big_from_bytes(&sm2_gx, _gx, sizeof(_gx));
+    big_from_bytes(&sm2_gy, _gy, sizeof(_gy));
+    big_sub(&sm2_d_max, &sm2_n, &big_two);  // private key d in [1, n-2]
+    big_from_bytes(&sm2_2w, _2w, sizeof(_2w));
+    big_from_bytes(&sm2_2w_1, _2w_1, sizeof(_2w_1));
+
+#ifndef USE_SLOW_BIGINT
+    big_init(&sm2_a_field);
+    big_init(&sm2_b_field);
+    sgmsm_mont_init(&sm2_fp_ctx, &sm2_p);
+    sm2_fp_from_std(&sm2_a_field, &sm2_a);
+    sm2_fp_from_std(&sm2_b_field, &sm2_b);
+#endif
+}
+
+void sm2_destroy(void) {
+#ifndef USE_SLOW_BIGINT
+    big_destroy(&sm2_a_field);
+    big_destroy(&sm2_b_field);
+    sgmsm_mont_destroy(&sm2_fp_ctx);
+#endif
+
+    big_destroy(&sm2_p);
+    big_destroy(&sm2_a);
+    big_destroy(&sm2_b);
+    big_destroy(&sm2_n);
+    big_destroy(&sm2_gx);
+    big_destroy(&sm2_gy);
+    big_destroy(&sm2_d_max);
+    big_destroy(&sm2_2w);
+    big_destroy(&sm2_2w_1);
+}
+
+// This file operates, internally, on Jacobian coordinates. For a given
+// (x, y) position on the curve, the Jacobian coordinates are (x1, y1, z1)
+// where x = x1/z1² and y = y1/z1³. The greatest speedups come when the whole
+// calculation can be performed within the transform. But even for Add and
+// Double, it's faster to apply and reverse the transform than to operate
+// in affine coordinates.
+
+// returns a Jacobian Z value for the affine point (x, y)
+// usually we use (x, y, 1) as Jacobian point because it's easy to get.
+// value (4x, 8y, 2) or (9x, 27y, 3) are alternative, but hard to generate.
+// If x and y are zero, it assumes that they represent the point at infinity
+// because (0, 0) is not on the any of the curves handled here.
+void sm2_get_jacobian_z(big_t* z, const big_t* x, const big_t* y) {
+    if (big_cmp(x, &big_zero) != 0 && big_cmp(y, &big_zero) != 0) {
+        big_set(z, &big_one);
+    } else {
+        big_set(z, &big_zero);
+    }
+}
+
+// reverses the Jacobian transform. If the point is ∞ it returns 0, 0.
+void sm2_jacobian_to_affine(big_t* xout, big_t* yout, const big_t* x,
+                            const big_t* y, const big_t* z) {
+    SM_STATIC big_t fx, fy, fz;
+
+    big_init(&fx);
+    big_init(&fy);
+    big_init(&fz);
+
+    sm2_fp_from_std(&fx, x);
+    sm2_fp_from_std(&fy, y);
+    sm2_fp_from_std(&fz, z);
+    sm2_jacobian_to_affine_field(xout, yout, &fx, &fy, &fz);
+
+    big_destroy(&fx);
+    big_destroy(&fy);
+    big_destroy(&fz);
+}
+
+// takes two points in Jacobian coordinates, (x1, y1, z1) and
+// (x2, y2, z2) and returns their sum, in Jacobian form.
+// See
+// https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html#addition-add-2007-bl
+/*
+      Z1Z1 = Z1^2
+      Z2Z2 = Z2^2
+      U1 = X1*Z2Z2
+      U2 = X2*Z1Z1
+      S1 = Y1*Z2*Z2Z2
+      S2 = Y2*Z1*Z1Z1
+      H = U2-U1
+      I = (2*H)^2
+      J = H*I
+      r = 2*(S2-S1)
+      V = U1*I
+      X3 = r^2-J-2*V
+      Y3 = r*(V-X3)-2*S1*J
+      Z3 = ((Z1+Z2)^2-Z1Z1-Z2Z2)*H
+*/
+void sm2_add_jocabian(big_t* x3, big_t* y3, big_t* z3, const big_t* x1,
+                      const big_t* y1, const big_t* z1, const big_t* x2,
+                      const big_t* y2, const big_t* z2) {
+    SM_STATIC big_t fx1, fy1, fz1, fx2, fy2, fz2;
+    SM_STATIC big_t fx3, fy3, fz3;
+
+    big_init(&fx1);
+    big_init(&fy1);
+    big_init(&fz1);
+    big_init(&fx2);
+    big_init(&fy2);
+    big_init(&fz2);
+    big_init(&fx3);
+    big_init(&fy3);
+    big_init(&fz3);
+
+    sm2_fp_from_std(&fx1, x1);
+    sm2_fp_from_std(&fy1, y1);
+    sm2_fp_from_std(&fz1, z1);
+    sm2_fp_from_std(&fx2, x2);
+    sm2_fp_from_std(&fy2, y2);
+    sm2_fp_from_std(&fz2, z2);
+
+    sm2_add_jacobian_field(&fx3, &fy3, &fz3, &fx1, &fy1, &fz1, &fx2, &fy2,
+                           &fz2);
+
+    sm2_fp_to_std(x3, &fx3);
+    sm2_fp_to_std(y3, &fy3);
+    sm2_fp_to_std(z3, &fz3);
+
+    big_destroy(&fx1);
+    big_destroy(&fy1);
+    big_destroy(&fz1);
+    big_destroy(&fx2);
+    big_destroy(&fy2);
+    big_destroy(&fz2);
+    big_destroy(&fx3);
+    big_destroy(&fy3);
+    big_destroy(&fz3);
+}
+
 /* point P1+P2 */
-void sm2_add(big_t* x3, big_t* y3, big_t* x1, big_t* y1, big_t* x2, big_t* y2) {
+void sm2_add(big_t* x3, big_t* y3, big_t* x1, big_t* y1, big_t* x2,
+             big_t* y2) {
+    SM_STATIC big_t fx1, fy1, fx2, fy2;
     SM_STATIC big_t z1, z2, z3;
     SM_STATIC big_t tx, ty;
+
+    big_init(&fx1);
+    big_init(&fy1);
+    big_init(&fx2);
+    big_init(&fy2);
     big_init(&z1);
     big_init(&z2);
     big_init(&z3);
     big_init(&tx);
     big_init(&ty);
 
-    sm2_get_jacobian_z(&z1, x1, y1);
-    sm2_get_jacobian_z(&z2, x2, y2);
+    sm2_fp_from_std(&fx1, x1);
+    sm2_fp_from_std(&fy1, y1);
+    sm2_fp_from_std(&fx2, x2);
+    sm2_fp_from_std(&fy2, y2);
 
-    sm2_add_jocabian(&tx, &ty, &z3, x1, y1, &z1, x2, y2, &z2);
-    sm2_jacobian_to_affine(x3, y3, &tx, &ty, &z3);
-    /*
-    big_hexp("x1", x1);
-    big_hexp("y1", y1);
-    big_hexp("z1", &z1);
-    big_hexp("x2", x2);
-    big_hexp("y2", y2);
-    big_hexp("z2", &z2);
-    big_hexp("tx", &tx);
-    big_hexp("ty", &ty);
-    big_hexp("z3", &z3);
-    big_hexp("x3", x1);
-    big_hexp("y3", y1);
-    */
+    sm2_get_jacobian_z_field(&z1, &fx1, &fy1);
+    sm2_get_jacobian_z_field(&z2, &fx2, &fy2);
+    sm2_add_jacobian_field(&tx, &ty, &z3, &fx1, &fy1, &z1, &fx2, &fy2, &z2);
+    sm2_jacobian_to_affine_field(x3, y3, &tx, &ty, &z3);
 
+    big_destroy(&fx1);
+    big_destroy(&fy1);
+    big_destroy(&fx2);
+    big_destroy(&fy2);
     big_destroy(&z1);
     big_destroy(&z2);
     big_destroy(&z3);
@@ -361,140 +556,101 @@ void sm2_add(big_t* x3, big_t* y3, big_t* x1, big_t* y1, big_t* x2, big_t* y2) {
 */
 void sm2_double_jacobian(big_t* x3, big_t* y3, big_t* z3, const big_t* x1,
                          const big_t* y1, const big_t* z1) {
-    SM_STATIC big_t delta, gamma, beta, alpha, alpha2;
-    SM_STATIC big_t tmp1, tmp2;
-    SM_STATIC big_t eight, four;
-    SM_STATIC unsigned char eight_buf[] = {8};
-    SM_STATIC unsigned char four_buf[] = {4};
+    SM_STATIC big_t fx1, fy1, fz1, fx3, fy3, fz3;
 
-    big_init(&delta);
-    big_init(&gamma);
-    big_init(&beta);
-    big_init(&alpha);
-    big_init(&alpha2);
-    big_init(&tmp1);
-    big_init(&tmp2);
-    big_init(&eight);
-    big_init(&four);
-    big_from_bytes(&eight, eight_buf, sizeof(eight_buf));
-    big_from_bytes(&four, four_buf, sizeof(four_buf));
+    big_init(&fx1);
+    big_init(&fy1);
+    big_init(&fz1);
+    big_init(&fx3);
+    big_init(&fy3);
+    big_init(&fz3);
 
-    big_mul(&tmp1, z1, z1);
-    big_mod(&delta, &tmp1, &sm2_p);  // delta = Z1^2
-    big_mul(&tmp1, y1, y1);
-    big_mod(&gamma, &tmp1, &sm2_p);  // gamma = Y1^2
-    big_mul(&tmp1, x1, &gamma);
-    big_mod(&beta, &tmp1, &sm2_p);  // beta = X1*gamma
-    // alpha = 3*(X1-delta)*(X1+delta)
-    big_sub(&alpha, x1, &delta);
-    while (big_cmp(&alpha, &big_zero) < 0) {
-        big_add(&tmp1, &alpha, &sm2_p);
-        big_set(&alpha, &tmp1);
-    }
-    big_add(&tmp1, x1, &delta);
-    big_mod(&alpha2, &tmp1, &sm2_p);
-    big_mul(&tmp1, &alpha, &alpha2);
-    big_mod(&alpha, &tmp1, &sm2_p);
-    big_mul(&tmp1, &alpha, &big_three);
-    big_mod(&alpha, &tmp1, &sm2_p);
+    sm2_fp_from_std(&fx1, x1);
+    sm2_fp_from_std(&fy1, y1);
+    sm2_fp_from_std(&fz1, z1);
+    sm2_double_jacobian_field(&fx3, &fy3, &fz3, &fx1, &fy1, &fz1);
 
-    // X3 = alpha^2-8*beta
-    big_mul(&tmp1, &alpha, &alpha);
-    big_mul(x3, &beta, &eight);
-    big_sub(&tmp2, &tmp1, x3);
-    while (big_cmp(&tmp2, &big_zero) < 0) {
-        big_add(&tmp1, &tmp2, &sm2_p);
-        big_set(&tmp2, &tmp1);
-    }
-    big_mod(x3, &tmp2, &sm2_p);
+    sm2_fp_to_std(x3, &fx3);
+    sm2_fp_to_std(y3, &fy3);
+    sm2_fp_to_std(z3, &fz3);
 
-    // Z3 = (Y1+Z1)^2-gamma-delta
-    big_add(&tmp1, y1, z1);
-    big_mod(z3, &tmp1, &sm2_p);
-    big_mul(&tmp1, z3, z3);
-    big_sub(z3, &tmp1, &gamma);
-    big_sub(&tmp1, z3, &delta);
-    while (big_cmp(&tmp1, &big_zero) < 0) {
-        big_add(&tmp2, &tmp1, &sm2_p);
-        big_set(&tmp1, &tmp2);
-    }
-    big_mod(z3, &tmp1, &sm2_p);
-
-    // Y3 = alpha*(4*beta-X3)-8*gamma^2
-    big_mul(&tmp1, &beta, &four);
-    big_sub(&tmp2, &tmp1, x3);
-    while (big_cmp(&tmp2, &big_zero) < 0) {
-        big_add(&tmp1, &tmp2, &sm2_p);
-        big_set(&tmp2, &tmp1);
-    }
-    big_mod(&tmp1, &tmp2, &sm2_p);  // 4*beta-x3
-    big_mul(&four, &alpha, &tmp1);
-    big_mod(&tmp2, &four, &sm2_p);  // alpha * (4*beta-3)
-    big_mul(&tmp1, &gamma, &gamma);
-    big_mod(&delta, &tmp1, &sm2_p);
-    big_mul(y3, &delta, &eight);
-    big_mod(&gamma, y3, &sm2_p);  // 8*gamma^2
-    big_sub(&tmp1, &tmp2, &gamma);
-    while (big_cmp(&tmp1, &big_zero) < 0) {
-        big_add(&tmp2, &tmp1, &sm2_p);
-        big_set(&tmp1, &tmp2);
-    }
-    big_mod(y3, &tmp1, &sm2_p);
-
-    big_destroy(&delta);
-    big_destroy(&gamma);
-    big_destroy(&beta);
-    big_destroy(&alpha);
-    big_destroy(&alpha2);
-    big_destroy(&tmp1);
-    big_destroy(&tmp2);
-    big_destroy(&eight);
-    big_destroy(&four);
+    big_destroy(&fx1);
+    big_destroy(&fy1);
+    big_destroy(&fz1);
+    big_destroy(&fx3);
+    big_destroy(&fy3);
+    big_destroy(&fz3);
 }
 
 void sm2_double(big_t* x3, big_t* y3, big_t* x1, big_t* y1) {
+    SM_STATIC big_t fx1, fy1;
     SM_STATIC big_t z1, z3;
     SM_STATIC big_t tx, ty;
+
+    big_init(&fx1);
+    big_init(&fy1);
     big_init(&z1);
     big_init(&z3);
     big_init(&tx);
     big_init(&ty);
 
-    sm2_get_jacobian_z(&z1, x1, y1);
-    sm2_double_jacobian(&tx, &ty, &z3, x1, y1, &z1);
-    sm2_jacobian_to_affine(x3, y3, &tx, &ty, &z3);
+    sm2_fp_from_std(&fx1, x1);
+    sm2_fp_from_std(&fy1, y1);
+    sm2_get_jacobian_z_field(&z1, &fx1, &fy1);
+    sm2_double_jacobian_field(&tx, &ty, &z3, &fx1, &fy1, &z1);
+    sm2_jacobian_to_affine_field(x3, y3, &tx, &ty, &z3);
 
+    big_destroy(&fx1);
+    big_destroy(&fy1);
     big_destroy(&z1);
     big_destroy(&z3);
+    big_destroy(&tx);
+    big_destroy(&ty);
 }
 
-// (x3, y3) <- k * P(gx, by)
+// (x3, y3) <- k * P(gx, gy)
 void sm2_scalar_mult(big_t* x3, big_t* y3, const big_t* bx, const big_t* by,
                      const big_t* k) {
-    SM_STATIC big_t bz, z3;
+    SM_STATIC big_t fbx, fby, bz;
+    SM_STATIC big_t rx, ry, rz;
     unsigned long i, j, byte;
     SM_STATIC unsigned char buf[SM2_MAX_BIG_BYTES];
     unsigned long len = sizeof(buf);
 
+    big_init(&fbx);
+    big_init(&fby);
     big_init(&bz);
-    big_init(&z3);
-    big_set(x3, &big_zero);
-    big_set(y3, &big_zero);
-    big_set(&z3, &big_zero);
-    sm2_get_jacobian_z(&bz, bx, by);
+    big_init(&rx);
+    big_init(&ry);
+    big_init(&rz);
+
+    sm2_fp_from_std(&fbx, bx);
+    sm2_fp_from_std(&fby, by);
+    sm2_get_jacobian_z_field(&bz, &fbx, &fby);
+    big_set(&rx, &big_zero);
+    big_set(&ry, &big_zero);
+    big_set(&rz, &big_zero);
 
     big_to_bytes(buf, &len, k);
     for (i = 0; i < len; i++) {
         byte = (unsigned long)buf[i];
         for (j = 0; j < 8; j++) {
-            sm2_double_jacobian(x3, y3, &z3, x3, y3, &z3);
+            sm2_double_jacobian_field(&rx, &ry, &rz, &rx, &ry, &rz);
             if ((byte & 0x80) == 0x80) {
-                sm2_add_jocabian(x3, y3, &z3, x3, y3, &z3, bx, by, &bz);
+                sm2_add_jacobian_field(&rx, &ry, &rz, &rx, &ry, &rz, &fbx,
+                                       &fby, &bz);
             }
             byte <<= 1;
         }
     }
-    sm2_jacobian_to_affine(x3, y3, x3, y3, &z3);
+    sm2_jacobian_to_affine_field(x3, y3, &rx, &ry, &rz);
+
+    big_destroy(&fbx);
+    big_destroy(&fby);
+    big_destroy(&bz);
+    big_destroy(&rx);
+    big_destroy(&ry);
+    big_destroy(&rz);
 }
 
 int sm2_infinit_p(const big_t* x, const big_t* y) {
@@ -502,38 +658,42 @@ int sm2_infinit_p(const big_t* x, const big_t* y) {
 }
 
 int sm2_on_curve_p(const big_t* x, const big_t* y) {
-    SM_STATIC big_t tmp1, tmp2, tmp3, tmp4;
+    SM_STATIC big_t fx, fy;
+    SM_STATIC big_t lhs, rhs, tmp1, tmp2;
     int r;
 
+    big_init(&fx);
+    big_init(&fy);
+    big_init(&lhs);
+    big_init(&rhs);
     big_init(&tmp1);
     big_init(&tmp2);
-    big_init(&tmp3);
-    big_init(&tmp4);
 
-    big_mul(&tmp2, y, y);
-    big_mod(&tmp1, &tmp2, &sm2_p);  // tmp1 <- y^2
+    sm2_fp_from_std(&fx, x);
+    sm2_fp_from_std(&fy, y);
 
-    big_mul(&tmp3, x, x);
-    big_mod(&tmp2, &tmp3, &sm2_p);  // tmp2 <- x^2
-    big_mul(&tmp3, &tmp2, x);
-    big_mod(&tmp2, &tmp3, &sm2_p);  // tmp2 <- x^3
+    sm2_fp_sqr(&lhs, &fy);
+    sm2_fp_sqr(&tmp1, &fx);
+    sm2_fp_mul(&rhs, &tmp1, &fx);
 
-    big_mul(&tmp4, &sm2_a, x);
-    big_mod(&tmp3, &tmp4, &sm2_p);  // tmp3 <- ax
+#ifndef USE_SLOW_BIGINT
+    sm2_fp_mul(&tmp1, &sm2_a_field, &fx);
+    sm2_fp_add(&tmp2, &rhs, &tmp1);
+    sm2_fp_add(&rhs, &tmp2, &sm2_b_field);
+#else
+    sm2_fp_mul(&tmp1, &sm2_a, &fx);
+    sm2_fp_add(&tmp2, &rhs, &tmp1);
+    sm2_fp_add(&rhs, &tmp2, &sm2_b);
+#endif
 
-    big_add(&tmp4, &tmp2, &tmp3);
-    big_add(&tmp3, &tmp4, &sm2_b);
-    big_mod(&tmp2, &tmp3, &sm2_p);
+    r = (big_cmp(&lhs, &rhs) == 0);
 
-    if (big_cmp(&tmp1, &tmp2) == 0)
-        r = 1;
-    else
-        r = 0;
-
+    big_destroy(&fx);
+    big_destroy(&fy);
+    big_destroy(&lhs);
+    big_destroy(&rhs);
     big_destroy(&tmp1);
     big_destroy(&tmp2);
-    big_destroy(&tmp3);
-    big_destroy(&tmp4);
 
     return r;
 }
