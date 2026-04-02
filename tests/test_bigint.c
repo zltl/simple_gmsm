@@ -1,5 +1,5 @@
 #include "test_common.h"
-#include "simple_gmsm/slow_dirty_bigint.h"
+#include "simple_gmsm/big.h"
 
 TEST_CASE(test_big_add) {
     big_t a, b, c;

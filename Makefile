@@ -23,7 +23,12 @@ COMMON_FLAG += -I$(PROJECT_ROOT_PATH)/include -I${PROJECT_ROOT_PATH}/include
 CFLAGS += $(COMMON_FLAG) -std=$(C_STANDARD)
 CXXFLAGS += $(COMMON_FLAG) -std=$(CXX_STANDARD)
 
-sources_c = $(wildcard *.c)
+ifdef USE_SLOW_BIGINT
+COMMON_FLAG += -DUSE_SLOW_BIGINT
+sources_c = $(filter-out fast_bigint.c, $(wildcard *.c))
+else
+sources_c = $(filter-out slow_dirty_bigint.c, $(wildcard *.c))
+endif
 sources_cxx = $(wildcard *.cc)
 headers = $(wildcard *.h)
 objs_c = $(patsubst %.c,$(TARGET_DIR)/%.c.o,$(sources_c))
