@@ -1,4 +1,4 @@
-.PHONY: clean doxy latex libsimple_gmsm test
+.PHONY: clean doxy latex libsimple_gmsm test examples
 .ONESHELL:
 
 all: doxy latex libsimple_gmsm
@@ -58,3 +58,17 @@ $(TARGET_DIR)/tests/%.c.o: tests/%.c
 
 $(TARGET_DIR)/test_runner: $(test_objs) $(TARGET_DIR)/libsimple_gmsm.a
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# Examples
+example_sources = $(wildcard examples/example_*.c)
+example_bins = $(patsubst examples/%.c,$(TARGET_DIR)/examples/%,$(example_sources))
+
+$(shell mkdir -p $(TARGET_DIR)/examples)
+
+examples: $(example_bins)
+
+$(TARGET_DIR)/examples/%: examples/%.c $(TARGET_DIR)/libsimple_gmsm.a
+	$(CC) $(CFLAGS) -o $@ $< $(TARGET_DIR)/libsimple_gmsm.a -lm
+
+clean:
+	rm -rf $(TARGET_DIR)
